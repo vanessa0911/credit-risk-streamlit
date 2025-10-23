@@ -1,0 +1,6 @@
+[server]
+headless = true
+runOnSave = true
+[theme]
+base="light"
+primaryColor="#0E5CAD"
