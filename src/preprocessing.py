@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from typing import List
 
 def align_features(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
@@ -11,10 +10,9 @@ def align_features(df: pd.DataFrame, feature_names: List[str]) -> pd.DataFrame:
 
 def simple_impute(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]):
-            df[col] = df[col].fillna(df[col].median())
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = df[c].fillna(df[c].median())
         else:
-            mode = df[col].mode()
-            df[col] = df[col].fillna(mode.iloc[0] if not mode.empty else "")
+            df[c] = df[c].fillna(df[c].mode().iloc[0] if not df[c].mode().empty else "")
     return df
