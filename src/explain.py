@@ -1,5 +1,6 @@
 from pathlib import Path
-import pandas as pd, json
+import pandas as pd
+import json
 
 ARTIFACTS = Path("artifacts")
 
