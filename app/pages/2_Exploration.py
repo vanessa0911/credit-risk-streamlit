@@ -6,7 +6,6 @@ from pathlib import Path
 import plotly.express as px
 from pandas.api.types import is_numeric_dtype, is_categorical_dtype
 
-# Réutilise la logique existante du repo
 from src.inference import load_models, expected_columns
 from src.feature_engineering import add_derived_features
 
@@ -17,15 +16,14 @@ st.title("🔎 Exploration des données clients")
 # 0) Utilitaires
 # ---------------------------------------------------------
 def repo_root() -> Path:
-    """Ce fichier est <repo>/app/pages/... -> remonte à la racine repo."""
     return Path(__file__).resolve().parents[2]
 
 def list_candidate_csvs(max_size=20_000_000) -> list:
     """
-    Ordre de priorité:
+    Priorité:
       1) ./local_example.csv
       2) data/processed/sample_clients.csv
-      3) tous les petits CSV dans data/processed/, artifacts/, puis racine
+      3) petits CSV dans data/processed/, artifacts/, puis racine
     """
     root = repo_root()
     candidates = []
@@ -74,13 +72,9 @@ with col_top[3]:
 cands = list_candidate_csvs()
 if not cands:
     st.warning(
-        "Aucun dataset client exploitable trouvé.\n\n"
-        "Recherché automatiquement :\n"
-        "• ./local_example.csv (racine du repo)\n"
-        "• data/processed/sample_clients.csv\n"
-        "• data/processed/*.csv\n"
-        "• artifacts/*.csv\n"
-        "• ./*.csv (racine)"
+        "Aucun dataset exploitable.\n"
+        "Recherché : ./local_example.csv, data/processed/sample_clients.csv, "
+        "puis petits CSV dans data/processed/, artifacts/ et racine."
     )
     st.stop()
 
@@ -96,62 +90,62 @@ with st.expander("🔍 Infos (debug rapide)"):
     st.write("CSV détectés :", choices)
     st.write("Colonnes (aperçu) :", list(df_raw.columns)[:20])
 
+# Si le dataset ressemble à un tableau d'importance (raw_feature/contribution), prévenir
+if set(df_raw.columns[:2]) >= {"raw_feature", "contribution"} or set(df_raw.columns) == {"raw_feature", "contribution"}:
+    st.info(
+        "ℹ️ Le fichier chargé ressemble à une **table d'importance globale** "
+        "(colonnes `raw_feature`, `contribution`). Il ne contient pas de variables 'client' "
+        "comme `AMT_CREDIT` ou `DOC_COUNT`. Les graphiques utiliseront la "
+        "**probabilité calculée** comme métrique par défaut."
+    )
+
 # ---------------------------------------------------------
 # 2) Identifiant client
 # ---------------------------------------------------------
 cand_ids = [c for c in ["SK_ID_CURR", "client_id", "ID", "customer_id", "id"] if c in df_raw.columns]
 CLIENT_ID = cand_ids[0] if cand_ids else None
 if CLIENT_ID is None:
-    df_raw = df_raw.reset_index().rename(columns={"index": "row_id"})
+    df_raw = df_raw.reset_index(drop=False).rename(columns={"index": "row_id"})
     CLIENT_ID = "row_id"
 
 # ---------------------------------------------------------
 # 3) Features pour le modèle (batch, robustes aux colonnes manquantes)
-#    >>> Correction importante: imputation des colonnes non numériques
-#    >>> compatible avec les dtypes 'category' (ajout de la catégorie 'Unknown')
-#    >>> puis conversion numérique de secours si possible pour éviter les objets.
+#    >>> imputation 'Unknown' compatible avec dtype 'category'
 # ---------------------------------------------------------
 @st.cache_data
 def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df2 = add_derived_features(df)
-    cols = expected_columns()  # colonnes exactes attendues (metadata.json)
+    cols = expected_columns()
 
-    # Ajout des colonnes manquantes
+    # Ajout colonnes manquantes + ordre
     for c in cols:
         if c not in df2.columns:
             df2[c] = np.nan
-
-    # Ordre exact
     df2 = df2[cols]
 
-    # Imputation & types robustes
+    # Imputation robuste
     for c in df2.columns:
         s = df2[c]
         if is_numeric_dtype(s):
-            # num -> NaN -> 0
             df2[c] = pd.to_numeric(s, errors="coerce").fillna(0)
         else:
-            # Catégorie: autoriser 'Unknown' comme nouvelle catégorie
             if is_categorical_dtype(s):
                 df2[c] = s.cat.add_categories(["Unknown"]).fillna("Unknown")
             else:
                 df2[c] = s.fillna("Unknown")
-
-            # Tentative de conversion numérique (si ce sont en fait des codes)
+            # Tentative conversion numérique si ce sont des codes
             s_num = pd.to_numeric(df2[c], errors="coerce")
             if s_num.notna().any():
                 df2[c] = s_num.fillna(0)
             else:
-                # sinon, garde 'Unknown' en texte (CatBoost sait gérer les objets)
                 df2[c] = df2[c].astype(str)
 
-    # Nettoyage valeurs infinies
     df2.replace([np.inf, -np.inf], 0, inplace=True)
     return df2
 
 @st.cache_data
 def derived_for_plot(df: pd.DataFrame) -> pd.DataFrame:
-    """On veut certaines colonnes dérivées potentielles pour les graphes (si existantes)."""
+    """Certaines colonnes dérivées utiles pour les graphes, si existantes."""
     d = add_derived_features(df)
     keep = [c for c in ["DOC_COUNT", "AMT_CREDIT", "AMT_ANNUITY", "PAYMENT_RATE"] if c in d.columns]
     return d[keep] if keep else pd.DataFrame(index=df.index)
@@ -180,58 +174,63 @@ with st.spinner("Préparation des features et calcul des probabilités…"):
 df_plot = df_raw.copy()
 df_plot["proba_default"] = proba
 
-# On ajoute (si possible) quelques dérivées utiles pour les graphes
+# Joindre dérivées pour alimenter les graphes si dispo
 df_add = derived_for_plot(df_raw)
 if not df_add.empty:
     df_plot = df_plot.join(df_add, how="left")
 
 # ---------------------------------------------------------
-# 5) CHART #1 — Top clients par activité (transactions/documents/crédit)
-#    Fallback final: Top par probabilité si aucune colonne métrique n'existe
+# 5) CHART #1 — Top par métrique choisie (garantie d'avoir quelque chose)
 # ---------------------------------------------------------
-st.markdown("### 1) 🏆 Top clients par activité")
+st.markdown("### 1) 🏆 Top par métrique")
 
-def pick_activity_column(cols):
-    low = [c.lower() for c in cols]
-    # candidats contenant "transaction"
-    for i, c in enumerate(low):
-        if ("transaction" in c) or (c in {"transaction_count", "transactions", "nb_transactions", "txn", "n_transactions"}):
-            return cols[i]
-    # fallbacks successifs
-    for candidate in ["DOC_COUNT", "AMT_CREDIT", "AMT_INCOME_TOTAL"]:
-        if candidate in cols:
-            return candidate
-    return None
+# Liste de métriques possibles, en ordre de préférence
+metric_options = []
+# Colonnes "transactions"
+for col in df_plot.columns:
+    low = col.lower()
+    if "transaction" in low or low in {"transaction_count", "transactions", "nb_transactions", "txn", "n_transactions"}:
+        metric_options.append(col)
+# Proxies usuels
+for col in ["DOC_COUNT", "AMT_CREDIT", "AMT_INCOME_TOTAL"]:
+    if col in df_plot.columns and col not in metric_options:
+        metric_options.append(col)
+# Toujours dispo : proba
+if "proba_default" not in metric_options:
+    metric_options.append("proba_default")
 
-metric_col = pick_activity_column(df_plot.columns)
-
-if metric_col is None:
-    # Fallback: Top par proba_default (toujours dispo)
-    st.info("Aucune colonne 'transactions' ni proxy (DOC_COUNT/AMT_CREDIT/AMT_INCOME_TOTAL). Affichage du Top par probabilité.")
-    metric_col = "proba_default"
+metric_col = st.selectbox("Métrique à classer (Top N)", metric_options, index=0)
 
 top_n = st.slider("Afficher le Top N", 5, min(50, len(df_plot)), min(10, len(df_plot)), 1)
 df_top = df_plot[[CLIENT_ID, metric_col]].copy()
 df_top = df_top.sort_values(metric_col, ascending=False).head(top_n)
 
-fig1 = px.bar(
-    df_top,
-    x=metric_col,
-    y=CLIENT_ID,
-    orientation="h",
-    title=f"Top {top_n} clients par {metric_col}",
-    hover_data=[CLIENT_ID, metric_col],
-)
-fig1.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
-st.plotly_chart(fig1, use_container_width=True)
+if df_top[metric_col].notna().any():
+    fig1 = px.bar(
+        df_top,
+        x=metric_col,
+        y=CLIENT_ID,
+        orientation="h",
+        title=f"Top {top_n} par {metric_col}",
+        hover_data=[CLIENT_ID, metric_col],
+    )
+    fig1.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
+    st.plotly_chart(fig1, use_container_width=True)
+    st.caption(
+        "Lecture : les barres représentent la valeur de la métrique sélectionnée pour les clients en tête. "
+        "Si la métrique est `proba_default`, il s’agit de la probabilité de défaut calculée par le modèle."
+    )
+else:
+    st.info("Aucune valeur exploitable pour cette métrique dans le dataset.")
+    st.dataframe(df_top, use_container_width=True)
 
-chosen = st.selectbox("Focus client (détails ligne brute)", df_top[CLIENT_ID].astype(str).tolist())
+chosen = st.selectbox("Focus client (affichage de la ligne d’origine)", df_top[CLIENT_ID].astype(str).tolist())
 st.write(df_plot[df_plot[CLIENT_ID].astype(str) == str(chosen)].head(1))
 
 # ---------------------------------------------------------
-# 6) CHART #2 — Carte Montant ↔ Risque (sinon histogramme des probas)
+# 6) CHART #2 — Carte Montant ↔ Risque OU histogramme des probabilités
 # ---------------------------------------------------------
-st.markdown("### 2) 📌 Carte Montant ↔ Risque (couleur = probabilité de défaut)")
+st.markdown("### 2) 📌 Carte Montant ↔ Risque (ou distribution des probabilités)")
 
 x_col = "AMT_CREDIT" if "AMT_CREDIT" in df_plot.columns else None
 y_col = "AMT_ANNUITY" if "AMT_ANNUITY" in df_plot.columns else ("PAYMENT_RATE" if "PAYMENT_RATE" in df_plot.columns else None)
@@ -256,7 +255,15 @@ if x_col and y_col and df_plot[x_col].notna().any() and df_plot[y_col].notna().a
         title=f"{x_col} vs {y_col} – couleur = probabilité de défaut",
     )
     st.plotly_chart(fig2, use_container_width=True)
+    st.caption(
+        "Lecture : chaque point est un client. L’axe X est le montant de crédit, l’axe Y l’annuité (ou le `PAYMENT_RATE`). "
+        "La couleur indique la probabilité de défaut : plus la couleur est intense, plus le risque estimé est élevé."
+    )
 else:
-    st.info("Colonnes nécessaires indisponibles pour le scatter. Affichage de la distribution des probabilités.")
+    # Fallback garanti: histogramme des probas
     fig2 = px.histogram(df_plot, x="proba_default", nbins=30, title="Distribution des probabilités de défaut")
     st.plotly_chart(fig2, use_container_width=True)
+    st.caption(
+        "Lecture : répartition des probabilités de défaut calculées par le modèle sur le dataset chargé. "
+        "Utile quand les colonnes Montant/Annuité n’existent pas (ex. jeu non transactionnel)."
+    )
