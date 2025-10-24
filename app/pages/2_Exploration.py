@@ -12,63 +12,112 @@ from src.feature_engineering import add_derived_features
 st.set_page_config(page_title="Exploration clients", layout="wide")
 st.title("🔎 Exploration des données clients")
 
-############################################
-# 1) Charger un dataset déjà présent dans le repo
-#    Ordre de recherche :
-#    - ./local_example.csv (racine du repo)
-#    - data/processed/ (premier petit CSV trouvé)
-#    - artifacts/ (premier petit CSV trouvé)
-############################################
-SEARCH_ORDER = [
-    Path("local_example.csv"),                    # racine du repo
-    Path("data/processed/sample_clients.csv"),    # nom explicite si présent
-]
+# ---------------------------------------------------------
+# 0) Outils
+# ---------------------------------------------------------
+def repo_root() -> Path:
+    """
+    Ce fichier est: <repo>/app/pages/2_Exploration_Clients.py
+    parents[0] = app/pages
+    parents[1] = app
+    parents[2] = <repo>
+    """
+    return Path(__file__).resolve().parents[2]
 
-@st.cache_data
-def load_any_dataset():
-    # a) chemins explicites
-    for p in SEARCH_ORDER:
-        if p.exists():
-            try:
-                df = pd.read_csv(p)
-                return df, str(p)
-            except Exception:
-                pass
+def list_candidate_csvs(max_size=20_000_000) -> list:
+    """
+    Renvoie une liste de CSV candidats (ordre de priorité) déjà présents dans le repo.
+    Priorité:
+      1) ./local_example.csv (à la racine, sans limite de taille)
+      2) data/processed/sample_clients.csv (si présent)
+      3) Tous les *.csv "petits" dans data/processed/, artifacts/, puis racine
+    """
+    root = repo_root()
+    candidates = []
 
-    # b) fallback : premier "petit" CSV trouvé dans data/processed puis artifacts puis racine
-    for root in ["data/processed", "artifacts", "."]:
-        pr = Path(root)
-        if pr.exists():
-            candidates = [p for p in pr.glob("*.csv") if p.stat().st_size <= 5_000_000]
-            for p in sorted(candidates):
+    # a) chemins explicites (sans limite pour local_example.csv)
+    p_local = root / "local_example.csv"
+    if p_local.exists() and p_local.is_file():
+        candidates.append(p_local)
+
+    p_sample = root / "data/processed/sample_clients.csv"
+    if p_sample.exists() and p_sample.is_file():
+        candidates.append(p_sample)
+
+    # b) fallbacks (avec limite de taille pour éviter les gros dumps)
+    for folder in ["data/processed", "artifacts", "."]:
+        base = (root / folder).resolve()
+        if base.exists() and base.is_dir():
+            for p in sorted(base.glob("*.csv")):
+                # évite de dupliquer les explicites déjà ajoutés
+                if p in candidates:
+                    continue
                 try:
-                    df = pd.read_csv(p)
-                    return df, f"{root}/{p.name}"
+                    if p.stat().st_size <= max_size:
+                        candidates.append(p)
                 except Exception:
                     continue
-    return None, None
 
-df_raw, src_name = load_any_dataset()
+    # unicité en conservant l'ordre
+    seen, uniq = set(), []
+    for p in candidates:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
 
-if df_raw is None or df_raw.empty:
-    st.warning("Aucun dataset client exploitable trouvé dans le repo "
-               "(recherché : ./local_example.csv, data/processed/*.csv, artifacts/*.csv).")
+@st.cache_data
+def load_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, low_memory=False)
+
+# ---------------------------------------------------------
+# 1) Sélection / chargement du dataset
+# ---------------------------------------------------------
+col_top = st.columns([1, 1, 2, 1])
+with col_top[3]:
+    if st.button("🔄 Recharger"):
+        st.cache_data.clear()
+        st.rerun()
+
+cands = list_candidate_csvs()
+if not cands:
+    st.warning(
+        "Aucun dataset client exploitable trouvé.\n\n"
+        "Recherché automatiquement :\n"
+        "• ./local_example.csv (racine du repo)\n"
+        "• data/processed/sample_clients.csv\n"
+        "• data/processed/*.csv\n"
+        "• artifacts/*.csv\n"
+        "• ./*.csv (racine)\n\n"
+        "Astuce (terminal Codespaces) : `pwd` doit pointer sur la racine du repo, "
+        "et `ls -lh local_example.csv` doit trouver le fichier."
+    )
     st.stop()
 
-st.success(f"Dataset chargé : **{src_name}** – {len(df_raw)} lignes, {df_raw.shape[1]} colonnes.")
+choices = [str(p.relative_to(repo_root())) for p in cands]
+sel = st.selectbox("Source de données détectée :", choices, index=0)
+src_path = repo_root() / sel
+df_raw = load_csv(src_path)
 
-############################################
+st.success(f"Dataset chargé : **{sel}** — {len(df_raw)} lignes, {df_raw.shape[1]} colonnes.")
+
+with st.expander("🔍 Infos (debug rapide)"):
+    st.write("Racine du repo :", str(repo_root()))
+    st.write("Fichiers CSV détectés :", choices)
+    st.write("Colonnes (aperçu) :", list(df_raw.columns)[:20])
+
+# ---------------------------------------------------------
 # 2) Détection d'un identifiant client
-############################################
-CAND_ID = [c for c in ["SK_ID_CURR", "client_id", "ID", "customer_id", "id"] if c in df_raw.columns]
-CLIENT_ID = CAND_ID[0] if CAND_ID else None
+# ---------------------------------------------------------
+cand_ids = [c for c in ["SK_ID_CURR", "client_id", "ID", "customer_id", "id"] if c in df_raw.columns]
+CLIENT_ID = cand_ids[0] if cand_ids else None
 if CLIENT_ID is None:
     df_raw = df_raw.reset_index().rename(columns={"index": "row_id"})
     CLIENT_ID = "row_id"
 
-############################################
+# ---------------------------------------------------------
 # 3) Construire les features attendues par le modèle (batch)
-############################################
+# ---------------------------------------------------------
 @st.cache_data
 def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df2 = add_derived_features(df)
@@ -83,11 +132,13 @@ def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = df2[c].fillna(0)
         else:
             df2[c] = df2[c].fillna("Unknown")
+    # Nettoyage valeurs infinies
+    df2.replace([np.inf, -np.inf], 0, inplace=True)
     return df2
 
-############################################
-# 4) Choix du modèle + calcul des probabilités (pour colorer/ordonner)
-############################################
+# ---------------------------------------------------------
+# 4) Choix du modèle + calcul des probabilités
+# ---------------------------------------------------------
 @st.cache_resource
 def _models():
     return load_models()
@@ -97,8 +148,8 @@ if not models:
     st.error("Aucun modèle disponible dans artifacts/. Ajoute les .joblib + metadata.json puis relance.")
     st.stop()
 
-col_hdr = st.columns([1, 1, 2])
-with col_hdr[0]:
+col_model = st.columns([1, 3])
+with col_model[0]:
     model_name = st.selectbox("Modèle", list(models.keys()))
 model = models[model_name]
 
@@ -109,20 +160,14 @@ with st.spinner("Préparation des features et calcul des probabilités…"):
 df_plot = df_raw.copy()
 df_plot["proba_default"] = proba
 
-############################################
-# 5) CHART #1 — Top clients par activité
-#    Répond à : “quel est le client avec le plus de transactions ?”
-#    Heuristique :
-#      - si une colonne 'transactions' existe (txn/transaction_count...), on l’utilise
-#      - sinon fallback sur DOC_COUNT
-#      - sinon fallback sur AMT_CREDIT
-#      - sinon AMT_INCOME_TOTAL
-############################################
+# ---------------------------------------------------------
+# 5) CHART #1 — Top clients par activité (transactions/documents/crédit)
+# ---------------------------------------------------------
 st.markdown("### 1) 🏆 Top clients par activité")
 
 def pick_activity_column(cols):
     low = [c.lower() for c in cols]
-    # candidats "transactions"
+    # candidats contenant "transaction"
     for i, c in enumerate(low):
         if ("transaction" in c) or (c in {"transaction_count", "transactions", "nb_transactions", "txn", "n_transactions"}):
             return cols[i]
@@ -155,9 +200,9 @@ else:
     chosen = st.selectbox("Focus client (détails ligne brute)", df_top[CLIENT_ID].astype(str).tolist())
     st.write(df_plot[df_plot[CLIENT_ID].astype(str) == str(chosen)].head(1))
 
-############################################
+# ---------------------------------------------------------
 # 6) CHART #2 — Carte Montant ↔ Risque (colorée par proba)
-############################################
+# ---------------------------------------------------------
 st.markdown("### 2) 📌 Carte Montant ↔ Risque (couleur = probabilité de défaut)")
 
 x_col = "AMT_CREDIT" if "AMT_CREDIT" in df_plot.columns else None
@@ -186,9 +231,9 @@ if x_col and y_col:
 else:
     st.info("Colonnes nécessaires non trouvées pour le scatter (AMT_CREDIT et AMT_ANNUITY/PAYMENT_RATE).")
 
-############################################
+# ---------------------------------------------------------
 # 7) (Optionnel) Distribution des probabilités
-############################################
+# ---------------------------------------------------------
 with st.expander("📊 Distribution des probabilités (optionnel)"):
     fig3 = px.histogram(df_plot, x="proba_default", nbins=30, title="Distribution des probabilités de défaut")
     st.plotly_chart(fig3, use_container_width=True)
