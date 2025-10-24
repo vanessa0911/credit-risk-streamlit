@@ -5,17 +5,16 @@ __pycache__/
 *.ipynb_checkpoints
 .venv/
 .env
+.env.*
+.python-version
 
-# Données (jamais dans git normal)
+# Données (ne pas versionner les bruts / sorties locales)
 data/raw/
-data/processed/*.parquet
-data/processed/*.csv
-*.csv
-*.tsv
+data/processed/*
+!data/processed/README.md
 
 # Streamlit
 .streamlit/secrets.toml
-.streamlit/
 
 # OS / IDE
 .DS_Store
@@ -24,3 +23,6 @@ data/processed/*.csv
 
 # Logs / artefacts temporaires
 logs/
+*.log
+.tmp/
+.cache/
