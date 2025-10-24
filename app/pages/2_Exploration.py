@@ -1,4 +1,4 @@
-# app/pages/2_Exploration_Clients.py
+# app/pages/2_Exploration.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,29 +13,22 @@ st.set_page_config(page_title="Exploration clients", layout="wide")
 st.title("🔎 Exploration des données clients")
 
 # ---------------------------------------------------------
-# 0) Outils
+# 0) Utilitaires
 # ---------------------------------------------------------
 def repo_root() -> Path:
-    """
-    Ce fichier est: <repo>/app/pages/2_Exploration_Clients.py
-    parents[0] = app/pages
-    parents[1] = app
-    parents[2] = <repo>
-    """
+    """Ce fichier est <repo>/app/pages/... -> remonte à la racine repo."""
     return Path(__file__).resolve().parents[2]
 
 def list_candidate_csvs(max_size=20_000_000) -> list:
     """
-    Renvoie une liste de CSV candidats (ordre de priorité) déjà présents dans le repo.
-    Priorité:
-      1) ./local_example.csv (à la racine, sans limite de taille)
-      2) data/processed/sample_clients.csv (si présent)
-      3) Tous les *.csv "petits" dans data/processed/, artifacts/, puis racine
+    Ordre de priorité:
+      1) ./local_example.csv
+      2) data/processed/sample_clients.csv
+      3) tous les petits CSV dans data/processed/, artifacts/, puis racine
     """
     root = repo_root()
     candidates = []
 
-    # a) chemins explicites (sans limite pour local_example.csv)
     p_local = root / "local_example.csv"
     if p_local.exists() and p_local.is_file():
         candidates.append(p_local)
@@ -44,12 +37,10 @@ def list_candidate_csvs(max_size=20_000_000) -> list:
     if p_sample.exists() and p_sample.is_file():
         candidates.append(p_sample)
 
-    # b) fallbacks (avec limite de taille pour éviter les gros dumps)
     for folder in ["data/processed", "artifacts", "."]:
         base = (root / folder).resolve()
         if base.exists() and base.is_dir():
             for p in sorted(base.glob("*.csv")):
-                # évite de dupliquer les explicites déjà ajoutés
                 if p in candidates:
                     continue
                 try:
@@ -58,7 +49,7 @@ def list_candidate_csvs(max_size=20_000_000) -> list:
                 except Exception:
                     continue
 
-    # unicité en conservant l'ordre
+    # unicité
     seen, uniq = set(), []
     for p in candidates:
         if p not in seen:
@@ -88,9 +79,7 @@ if not cands:
         "• data/processed/sample_clients.csv\n"
         "• data/processed/*.csv\n"
         "• artifacts/*.csv\n"
-        "• ./*.csv (racine)\n\n"
-        "Astuce (terminal Codespaces) : `pwd` doit pointer sur la racine du repo, "
-        "et `ls -lh local_example.csv` doit trouver le fichier."
+        "• ./*.csv (racine)"
     )
     st.stop()
 
@@ -103,11 +92,11 @@ st.success(f"Dataset chargé : **{sel}** — {len(df_raw)} lignes, {df_raw.shape
 
 with st.expander("🔍 Infos (debug rapide)"):
     st.write("Racine du repo :", str(repo_root()))
-    st.write("Fichiers CSV détectés :", choices)
+    st.write("CSV détectés :", choices)
     st.write("Colonnes (aperçu) :", list(df_raw.columns)[:20])
 
 # ---------------------------------------------------------
-# 2) Détection d'un identifiant client
+# 2) Identifiant client
 # ---------------------------------------------------------
 cand_ids = [c for c in ["SK_ID_CURR", "client_id", "ID", "customer_id", "id"] if c in df_raw.columns]
 CLIENT_ID = cand_ids[0] if cand_ids else None
@@ -116,28 +105,34 @@ if CLIENT_ID is None:
     CLIENT_ID = "row_id"
 
 # ---------------------------------------------------------
-# 3) Construire les features attendues par le modèle (batch)
+# 3) Features pour le modèle (batch, robustes aux colonnes manquantes)
 # ---------------------------------------------------------
 @st.cache_data
 def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df2 = add_derived_features(df)
-    cols = expected_columns()  # colonnes exactes attendues par le modèle (metadata.json)
+    cols = expected_columns()  # colonnes exactes attendues (metadata.json)
     for c in cols:
         if c not in df2.columns:
             df2[c] = np.nan
     df2 = df2[cols]
-    # Imputation légère (fallback sûr)
+    # Imputation simple
     for c in df2.columns:
         if pd.api.types.is_numeric_dtype(df2[c]):
             df2[c] = df2[c].fillna(0)
         else:
             df2[c] = df2[c].fillna("Unknown")
-    # Nettoyage valeurs infinies
     df2.replace([np.inf, -np.inf], 0, inplace=True)
     return df2
 
+@st.cache_data
+def derived_for_plot(df: pd.DataFrame) -> pd.DataFrame:
+    """On veut certaines colonnes dérivées potentielles pour les graphes (si existantes)."""
+    d = add_derived_features(df)
+    keep = [c for c in ["DOC_COUNT", "AMT_CREDIT", "AMT_ANNUITY", "PAYMENT_RATE"] if c in d.columns]
+    return d[keep] if keep else pd.DataFrame(index=df.index)
+
 # ---------------------------------------------------------
-# 4) Choix du modèle + calcul des probabilités
+# 4) Modèle + probas
 # ---------------------------------------------------------
 @st.cache_resource
 def _models():
@@ -160,8 +155,14 @@ with st.spinner("Préparation des features et calcul des probabilités…"):
 df_plot = df_raw.copy()
 df_plot["proba_default"] = proba
 
+# On ajoute (si possible) quelques dérivées utiles pour les graphes
+df_add = derived_for_plot(df_raw)
+if not df_add.empty:
+    df_plot = df_plot.join(df_add, how="left")
+
 # ---------------------------------------------------------
 # 5) CHART #1 — Top clients par activité (transactions/documents/crédit)
+#    Fallback final: Top par probabilité si aucune colonne métrique n'existe
 # ---------------------------------------------------------
 st.markdown("### 1) 🏆 Top clients par activité")
 
@@ -171,7 +172,7 @@ def pick_activity_column(cols):
     for i, c in enumerate(low):
         if ("transaction" in c) or (c in {"transaction_count", "transactions", "nb_transactions", "txn", "n_transactions"}):
             return cols[i]
-    # fallback successifs
+    # fallbacks successifs
     for candidate in ["DOC_COUNT", "AMT_CREDIT", "AMT_INCOME_TOTAL"]:
         if candidate in cols:
             return candidate
@@ -180,35 +181,37 @@ def pick_activity_column(cols):
 metric_col = pick_activity_column(df_plot.columns)
 
 if metric_col is None:
-    st.info("Aucune colonne 'transactions' ni proxy (DOC_COUNT/AMT_CREDIT/AMT_INCOME_TOTAL) trouvée dans le dataset.")
-else:
-    top_n = st.slider("Afficher le Top N", 5, min(50, len(df_plot)), 10, 1)
-    df_top = df_plot[[CLIENT_ID, metric_col]].copy()
-    df_top = df_top.sort_values(metric_col, ascending=False).head(top_n)
+    # Fallback: Top par proba_default (toujours dispo)
+    st.info("Aucune colonne 'transactions' ni proxy (DOC_COUNT/AMT_CREDIT/AMT_INCOME_TOTAL). Affichage du Top par probabilité.")
+    metric_col = "proba_default"
 
-    fig1 = px.bar(
-        df_top,
-        x=metric_col,
-        y=CLIENT_ID,
-        orientation="h",
-        title=f"Top {top_n} clients par {metric_col}",
-        hover_data=[CLIENT_ID, metric_col],
-    )
-    fig1.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
-    st.plotly_chart(fig1, use_container_width=True)
+top_n = st.slider("Afficher le Top N", 5, min(50, len(df_plot)), min(10, len(df_plot)), 1)
+df_top = df_plot[[CLIENT_ID, metric_col]].copy()
+df_top = df_top.sort_values(metric_col, ascending=False).head(top_n)
 
-    chosen = st.selectbox("Focus client (détails ligne brute)", df_top[CLIENT_ID].astype(str).tolist())
-    st.write(df_plot[df_plot[CLIENT_ID].astype(str) == str(chosen)].head(1))
+fig1 = px.bar(
+    df_top,
+    x=metric_col,
+    y=CLIENT_ID,
+    orientation="h",
+    title=f"Top {top_n} clients par {metric_col}",
+    hover_data=[CLIENT_ID, metric_col],
+)
+fig1.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
+st.plotly_chart(fig1, use_container_width=True)
+
+chosen = st.selectbox("Focus client (détails ligne brute)", df_top[CLIENT_ID].astype(str).tolist())
+st.write(df_plot[df_plot[CLIENT_ID].astype(str) == str(chosen)].head(1))
 
 # ---------------------------------------------------------
-# 6) CHART #2 — Carte Montant ↔ Risque (colorée par proba)
+# 6) CHART #2 — Carte Montant ↔ Risque (sinon histogramme des probas)
 # ---------------------------------------------------------
 st.markdown("### 2) 📌 Carte Montant ↔ Risque (couleur = probabilité de défaut)")
 
 x_col = "AMT_CREDIT" if "AMT_CREDIT" in df_plot.columns else None
 y_col = "AMT_ANNUITY" if "AMT_ANNUITY" in df_plot.columns else ("PAYMENT_RATE" if "PAYMENT_RATE" in df_plot.columns else None)
 
-if x_col and y_col:
+if x_col and y_col and df_plot[x_col].notna().any() and df_plot[y_col].notna().any():
     colf1, colf2 = st.columns(2)
     with colf1:
         xmin, xmax = float(df_plot[x_col].min()), float(df_plot[x_col].max())
@@ -229,11 +232,6 @@ if x_col and y_col:
     )
     st.plotly_chart(fig2, use_container_width=True)
 else:
-    st.info("Colonnes nécessaires non trouvées pour le scatter (AMT_CREDIT et AMT_ANNUITY/PAYMENT_RATE).")
-
-# ---------------------------------------------------------
-# 7) (Optionnel) Distribution des probabilités
-# ---------------------------------------------------------
-with st.expander("📊 Distribution des probabilités (optionnel)"):
-    fig3 = px.histogram(df_plot, x="proba_default", nbins=30, title="Distribution des probabilités de défaut")
-    st.plotly_chart(fig3, use_container_width=True)
+    st.info("Colonnes nécessaires indisponibles pour le scatter. Affichage de la distribution des probabilités.")
+    fig2 = px.histogram(df_plot, x="proba_default", nbins=30, title="Distribution des probabilités de défaut")
+    st.plotly_chart(fig2, use_container_width=True)
