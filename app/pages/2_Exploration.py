@@ -18,47 +18,55 @@ st.title("🔎 Exploration des données clients")
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
-def list_candidate_csvs(max_size=20_000_000) -> list:
+ROOT = repo_root()
+
+def read_any(path: Path) -> pd.DataFrame:
+    """Lit .csv et .csv.gz selon l'extension."""
+    name = str(path).lower()
+    if name.endswith(".csv.gz") or name.endswith(".gz"):
+        return pd.read_csv(path, compression="gzip", low_memory=False)
+    return pd.read_csv(path, low_memory=False)
+
+def list_candidate_csvs() -> list[Path]:
     """
-    Priorité:
-      1) ./local_example.csv
-      2) data/processed/sample_clients.csv
-      3) petits CSV dans data/processed/, artifacts/, puis racine
+    Priorités sans limite de taille :
+      1) data/processed/sample_clients.csv
+      2) data/processed/sample_clients.csv.gz
+      3) local_example.csv (racine)
+    Puis scan 'raisonnable' (toutes tailles) :
+      4) data/processed/*.csv / *.csv.gz
+      5) artifacts/*.csv
+      6) ./*.csv
     """
-    root = repo_root()
-    candidates = []
+    cands: list[Path] = []
+    # Explicites en priorité (pas de filtre de taille)
+    explicit = [
+        ROOT / "data/processed/sample_clients.csv",
+        ROOT / "data/processed/sample_clients.csv.gz",
+        ROOT / "local_example.csv",
+    ]
+    for p in explicit:
+        if p.exists() and p.is_file():
+            cands.append(p)
 
-    p_local = root / "local_example.csv"
-    if p_local.exists() and p_local.is_file():
-        candidates.append(p_local)
-
-    p_sample = root / "data/processed/sample_clients.csv"
-    if p_sample.exists() and p_sample.is_file():
-        candidates.append(p_sample)
-
+    # Fallbacks (toutes tailles)
     for folder in ["data/processed", "artifacts", "."]:
-        base = (root / folder).resolve()
+        base = ROOT / folder
         if base.exists() and base.is_dir():
-            for p in sorted(base.glob("*.csv")):
-                if p in candidates:
-                    continue
-                try:
-                    if p.stat().st_size <= max_size:
-                        candidates.append(p)
-                except Exception:
-                    continue
+            for pat in ("*.csv", "*.csv.gz"):
+                cands.extend(sorted(base.glob(pat)))
 
     # unicité
-    seen, uniq = set(), []
-    for p in candidates:
+    uniq, seen = [], set()
+    for p in cands:
         if p not in seen:
             uniq.append(p)
             seen.add(p)
     return uniq
 
 @st.cache_data
-def load_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False)
+def load_csv_cached(path: str) -> pd.DataFrame:
+    return read_any(Path(path))
 
 # ---------------------------------------------------------
 # 1) Sélection / chargement du dataset
@@ -72,32 +80,31 @@ with col_top[3]:
 cands = list_candidate_csvs()
 if not cands:
     st.warning(
-        "Aucun dataset exploitable.\n"
-        "Recherché : ./local_example.csv, data/processed/sample_clients.csv, "
-        "puis petits CSV dans data/processed/, artifacts/ et racine."
+        "Aucun dataset exploitable trouvé.\n\n"
+        "Recherché (dans l'ordre) :\n"
+        "• data/processed/sample_clients.csv(.gz)\n"
+        "• ./local_example.csv\n"
+        "• data/processed/*.csv(.gz)\n"
+        "• artifacts/*.csv\n"
+        "• ./*.csv\n"
+        "Astuce : génère d’abord `data/processed/sample_clients.csv.gz` depuis la page 3, "
+        "ou décompresse-le en `.csv`."
     )
     st.stop()
 
-choices = [str(p.relative_to(repo_root())) for p in cands]
-sel = st.selectbox("Source de données détectée :", choices, index=0)
-src_path = repo_root() / sel
-df_raw = load_csv(src_path)
+choices = [str(p.relative_to(ROOT)) for p in cands]
+default_idx = 0  # sample_clients prioritaire si présent
+sel = st.selectbox("Source de données détectée :", choices, index=default_idx)
+src_path = ROOT / sel
+
+df_raw = load_csv_cached(str(src_path))
 
 st.success(f"Dataset chargé : **{sel}** — {len(df_raw)} lignes, {df_raw.shape[1]} colonnes.")
 
 with st.expander("🔍 Infos (debug rapide)"):
-    st.write("Racine du repo :", str(repo_root()))
-    st.write("CSV détectés :", choices)
+    st.write("Racine du repo :", str(ROOT))
+    st.write("CSV détectés (ordre d'essai) :", choices[:10], "…")
     st.write("Colonnes (aperçu) :", list(df_raw.columns)[:20])
-
-# Si le dataset ressemble à un tableau d'importance (raw_feature/contribution), prévenir
-if set(df_raw.columns[:2]) >= {"raw_feature", "contribution"} or set(df_raw.columns) == {"raw_feature", "contribution"}:
-    st.info(
-        "ℹ️ Le fichier chargé ressemble à une **table d'importance globale** "
-        "(colonnes `raw_feature`, `contribution`). Il ne contient pas de variables 'client' "
-        "comme `AMT_CREDIT` ou `DOC_COUNT`. Les graphiques utiliseront la "
-        "**probabilité calculée** comme métrique par défaut."
-    )
 
 # ---------------------------------------------------------
 # 2) Identifiant client
@@ -109,11 +116,11 @@ if CLIENT_ID is None:
     CLIENT_ID = "row_id"
 
 # ---------------------------------------------------------
-# 3) Features pour le modèle (batch, robustes aux colonnes manquantes)
-#    >>> imputation 'Unknown' compatible avec dtype 'category'
+# 3) Features pour le modèle (robustes aux colonnes manquantes)
 # ---------------------------------------------------------
 @st.cache_data
 def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    from pandas.api.types import is_numeric_dtype, is_categorical_dtype
     df2 = add_derived_features(df)
     cols = expected_columns()
 
@@ -133,7 +140,7 @@ def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
                 df2[c] = s.cat.add_categories(["Unknown"]).fillna("Unknown")
             else:
                 df2[c] = s.fillna("Unknown")
-            # Tentative conversion numérique si ce sont des codes
+            # Tentative de conversion numérique si pertinent
             s_num = pd.to_numeric(df2[c], errors="coerce")
             if s_num.notna().any():
                 df2[c] = s_num.fillna(0)
@@ -145,7 +152,6 @@ def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data
 def derived_for_plot(df: pd.DataFrame) -> pd.DataFrame:
-    """Certaines colonnes dérivées utiles pour les graphes, si existantes."""
     d = add_derived_features(df)
     keep = [c for c in ["DOC_COUNT", "AMT_CREDIT", "AMT_ANNUITY", "PAYMENT_RATE"] if c in d.columns]
     return d[keep] if keep else pd.DataFrame(index=df.index)
@@ -159,7 +165,7 @@ def _models():
 
 models = _models()
 if not models:
-    st.error("Aucun modèle disponible dans artifacts/. Ajoute les .joblib + metadata.json puis relance.")
+    st.error("Aucun modèle dans artifacts/. Ajoute les .joblib + metadata.json puis relance.")
     st.stop()
 
 col_model = st.columns([1, 3])
@@ -174,28 +180,24 @@ with st.spinner("Préparation des features et calcul des probabilités…"):
 df_plot = df_raw.copy()
 df_plot["proba_default"] = proba
 
-# Joindre dérivées pour alimenter les graphes si dispo
+# Joindre dérivées utiles si dispo
 df_add = derived_for_plot(df_raw)
 if not df_add.empty:
     df_plot = df_plot.join(df_add, how="left")
 
 # ---------------------------------------------------------
-# 5) CHART #1 — Top par métrique choisie (garantie d'avoir quelque chose)
+# 5) CHART #1 — Top par métrique
 # ---------------------------------------------------------
 st.markdown("### 1) 🏆 Top par métrique")
 
-# Liste de métriques possibles, en ordre de préférence
 metric_options = []
-# Colonnes "transactions"
 for col in df_plot.columns:
     low = col.lower()
     if "transaction" in low or low in {"transaction_count", "transactions", "nb_transactions", "txn", "n_transactions"}:
         metric_options.append(col)
-# Proxies usuels
 for col in ["DOC_COUNT", "AMT_CREDIT", "AMT_INCOME_TOTAL"]:
     if col in df_plot.columns and col not in metric_options:
         metric_options.append(col)
-# Toujours dispo : proba
 if "proba_default" not in metric_options:
     metric_options.append("proba_default")
 
@@ -217,18 +219,18 @@ if df_top[metric_col].notna().any():
     fig1.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
     st.plotly_chart(fig1, use_container_width=True)
     st.caption(
-        "Lecture : les barres représentent la valeur de la métrique sélectionnée pour les clients en tête. "
-        "Si la métrique est `proba_default`, il s’agit de la probabilité de défaut calculée par le modèle."
+        "Lecture : barres = valeur de la métrique pour les clients en tête. "
+        "Si la métrique est `proba_default`, c’est la probabilité de défaut calculée."
     )
 else:
-    st.info("Aucune valeur exploitable pour cette métrique dans le dataset.")
+    st.info("Aucune valeur exploitable pour cette métrique.")
     st.dataframe(df_top, use_container_width=True)
 
 chosen = st.selectbox("Focus client (affichage de la ligne d’origine)", df_top[CLIENT_ID].astype(str).tolist())
 st.write(df_plot[df_plot[CLIENT_ID].astype(str) == str(chosen)].head(1))
 
 # ---------------------------------------------------------
-# 6) CHART #2 — Carte Montant ↔ Risque OU histogramme des probabilités
+# 6) CHART #2 — Carte Montant ↔ Risque OU histogramme
 # ---------------------------------------------------------
 st.markdown("### 2) 📌 Carte Montant ↔ Risque (ou distribution des probabilités)")
 
@@ -256,14 +258,13 @@ if x_col and y_col and df_plot[x_col].notna().any() and df_plot[y_col].notna().a
     )
     st.plotly_chart(fig2, use_container_width=True)
     st.caption(
-        "Lecture : chaque point est un client. L’axe X est le montant de crédit, l’axe Y l’annuité (ou le `PAYMENT_RATE`). "
-        "La couleur indique la probabilité de défaut : plus la couleur est intense, plus le risque estimé est élevé."
+        "Chaque point = un client. X = montant de crédit, Y = annuité (ou `PAYMENT_RATE`). "
+        "La couleur indique la probabilité de défaut."
     )
 else:
-    # Fallback garanti: histogramme des probas
     fig2 = px.histogram(df_plot, x="proba_default", nbins=30, title="Distribution des probabilités de défaut")
     st.plotly_chart(fig2, use_container_width=True)
     st.caption(
-        "Lecture : répartition des probabilités de défaut calculées par le modèle sur le dataset chargé. "
-        "Utile quand les colonnes Montant/Annuité n’existent pas (ex. jeu non transactionnel)."
+        "Répartition des probabilités de défaut sur le dataset chargé. "
+        "Utile si `AMT_CREDIT` / `AMT_ANNUITY` ne sont pas disponibles."
     )
