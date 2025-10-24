@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import plotly.express as px
+from pandas.api.types import is_numeric_dtype, is_categorical_dtype
 
 # Réutilise la logique existante du repo
 from src.inference import load_models, expected_columns
@@ -106,21 +107,45 @@ if CLIENT_ID is None:
 
 # ---------------------------------------------------------
 # 3) Features pour le modèle (batch, robustes aux colonnes manquantes)
+#    >>> Correction importante: imputation des colonnes non numériques
+#    >>> compatible avec les dtypes 'category' (ajout de la catégorie 'Unknown')
+#    >>> puis conversion numérique de secours si possible pour éviter les objets.
 # ---------------------------------------------------------
 @st.cache_data
 def build_features_for_model(df: pd.DataFrame) -> pd.DataFrame:
     df2 = add_derived_features(df)
     cols = expected_columns()  # colonnes exactes attendues (metadata.json)
+
+    # Ajout des colonnes manquantes
     for c in cols:
         if c not in df2.columns:
             df2[c] = np.nan
+
+    # Ordre exact
     df2 = df2[cols]
-    # Imputation simple
+
+    # Imputation & types robustes
     for c in df2.columns:
-        if pd.api.types.is_numeric_dtype(df2[c]):
-            df2[c] = df2[c].fillna(0)
+        s = df2[c]
+        if is_numeric_dtype(s):
+            # num -> NaN -> 0
+            df2[c] = pd.to_numeric(s, errors="coerce").fillna(0)
         else:
-            df2[c] = df2[c].fillna("Unknown")
+            # Catégorie: autoriser 'Unknown' comme nouvelle catégorie
+            if is_categorical_dtype(s):
+                df2[c] = s.cat.add_categories(["Unknown"]).fillna("Unknown")
+            else:
+                df2[c] = s.fillna("Unknown")
+
+            # Tentative de conversion numérique (si ce sont en fait des codes)
+            s_num = pd.to_numeric(df2[c], errors="coerce")
+            if s_num.notna().any():
+                df2[c] = s_num.fillna(0)
+            else:
+                # sinon, garde 'Unknown' en texte (CatBoost sait gérer les objets)
+                df2[c] = df2[c].astype(str)
+
+    # Nettoyage valeurs infinies
     df2.replace([np.inf, -np.inf], 0, inplace=True)
     return df2
 
