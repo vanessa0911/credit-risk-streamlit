@@ -5,75 +5,65 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from pandas.api.types import is_numeric_dtype
-
 from src.inference import expected_columns  # colonnes que le modèle attend
 
 st.set_page_config(page_title="Gestion des données clients", layout="wide")
 st.title("🧰 Gestion des données clients (échantillonnage & compression)")
 
-# ---------------------------------------------------------------------
-# 0) Dossiers + garde-fous (évite FileExistsError si 'raw' est un fichier)
-# ---------------------------------------------------------------------
+# ------------------------------
+# 0) Chemins et garde-fous
+# ------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = ROOT / "data" / "raw"
 PROC_DIR = ROOT / "data" / "processed"
 
-def ensure_dir(path: Path, label: str):
-    """S'assure que 'path' est un dossier. Si le chemin existe mais n'est pas un dossier, on bloque proprement."""
-    if path.exists():
-        if not path.is_dir():
-            st.error(
-                f"Le chemin **{path.relative_to(ROOT)}** existe mais **n'est pas un dossier**.\n\n"
-                f"➡️ Renomme ou supprime cet élément puis relance (par ex. `mv {path.relative_to(ROOT)} {path.relative_to(ROOT)}.bak`)."
-            )
-            st.stop()
-    else:
-        # crée le parent si besoin, puis le dossier
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.mkdir(parents=False, exist_ok=True)
+def assert_raw_is_dir():
+    if RAW_DIR.exists() and not RAW_DIR.is_dir():
+        st.error(
+            f"⚠️ `{RAW_DIR.relative_to(ROOT)}` **existe mais n'est pas un dossier**.\n\n"
+            "Corrige via le terminal :\n"
+            f"```\ncd {ROOT}\nmv data/raw data/raw.bak\nmkdir -p data/raw data/processed\n```\n"
+            "Puis relance cette page."
+        )
+        st.stop()
 
-# sécurise les deux répertoires
-ensure_dir(PROC_DIR, "processed")
-ensure_dir(RAW_DIR, "raw")
+assert_raw_is_dir()  # ne crée rien; vérifie seulement
 
-st.markdown(
-    """
+st.markdown("""
 Cette page crée une **version légère** (≤ 25 MB) de tes données clients à partir d’un gros fichier :
-1) **Dépose** un CSV ou CSV.GZ (ou choisis-en un déjà présent dans `data/raw/`).
-2) On **garde** les colonnes utiles (celles du modèle, ajustables).
-3) On **échantillonne** automatiquement une taille cible.
-4) On **compresse** en `data/processed/sample_clients.csv.gz` (prêt pour GitHub).
-"""
-)
+1) **Choisis** un CSV/CSV.GZ dans `data/raw/` (ou uploade-le si la taille le permet).
+2) **Sélection** des colonnes utiles (celles du modèle, ajustables).
+3) **Échantillonnage** automatique pour tenir sous la taille cible.
+4) **Compression** en `data/processed/sample_clients.csv.gz` (prêt pour GitHub).
+""")
 
-# ---------------------------------------------------------------------
-# 1) Source de données : upload OU fichier déjà présent dans data/raw/
-# ---------------------------------------------------------------------
+# ------------------------------
+# 1) Source (upload OU data/raw)
+# ------------------------------
 st.subheader("1) Choisir la source")
 
 uploaded = st.file_uploader(
-    "Déposer un fichier (CSV ou CSV.GZ). Conseil : pour éviter l'erreur 413, uploade plutôt via l'explorateur Codespaces dans `data/raw/`",
-    type=["csv", "gz"],
-    accept_multiple_files=False,
+    "Uploader un CSV ou CSV.GZ (si possible). Astuce: pour éviter l'erreur 413, dépose le fichier via l'explorateur dans `data/raw/`.",
+    type=["csv", "gz"], accept_multiple_files=False,
 )
 
-existing_files = sorted(list(RAW_DIR.glob("*.csv"))) + sorted(list(RAW_DIR.glob("*.csv.gz")))
+existing = []
+if RAW_DIR.is_dir():
+    existing = sorted(list(RAW_DIR.glob("*.csv"))) + sorted(list(RAW_DIR.glob("*.csv.gz")))
+
 choice = st.selectbox(
     "… ou sélectionner un fichier déjà présent dans `data/raw/`",
-    ["— Aucun —"] + [str(f.relative_to(ROOT)) for f in existing_files],
+    ["— Aucun —"] + [str(p.relative_to(ROOT)) for p in existing],
     index=0
 )
 
 def read_any(path_or_buffer, name: str) -> pd.DataFrame:
-    """Lit CSV ou CSV.GZ selon l'extension / le nom."""
     nm = name.lower()
     if nm.endswith(".csv.gz") or nm.endswith(".gz"):
         return pd.read_csv(path_or_buffer, compression="gzip", low_memory=False)
     return pd.read_csv(path_or_buffer, low_memory=False)
 
-df = None
-source_name = None
-
+df, source_name = None, None
 if uploaded is not None:
     source_name = uploaded.name
     with st.spinner(f"Lecture de {source_name}…"):
@@ -91,31 +81,24 @@ st.success(f"Source chargée : **{source_name}** — {len(df):,} lignes, {df.sha
 with st.expander("Aperçu (10 premières lignes)"):
     st.dataframe(df.head(10), use_container_width=True)
 
-# ---------------------------------------------------------------------
-# 2) Colonnes à garder (auto + ajustables)
-# ---------------------------------------------------------------------
+# ------------------------------
+# 2) Colonnes à garder
+# ------------------------------
 st.subheader("2) Colonnes à garder")
 
 expected = expected_columns() or []
 expected_set = set(expected)
 
-# On garde colonnes du modèle + un identifiant si présent
 id_candidates = [c for c in ["SK_ID_CURR", "client_id", "ID", "customer_id", "id"] if c in df.columns]
 keep = [c for c in df.columns if c in expected_set]
 for cid in id_candidates:
     if cid not in keep:
         keep.append(cid)
-
 if not keep:
     st.warning("Aucune colonne du modèle trouvée. On sélectionne **toutes** les colonnes par défaut.")
     keep = list(df.columns)
 
-sel_cols = st.multiselect(
-    "Colonnes conservées (tu peux ajuster) :",
-    options=list(df.columns),
-    default=keep,
-)
-
+sel_cols = st.multiselect("Colonnes conservées (tu peux ajuster) :", options=list(df.columns), default=keep)
 df_sel = df[sel_cols].copy()
 
 # Downcast numérique pour réduire la taille
@@ -129,15 +112,15 @@ for c in df_sel.columns:
 
 st.write(f"Colonnes retenues : **{len(sel_cols)}**")
 
-# ---------------------------------------------------------------------
+# ------------------------------
 # 3) Taille cible & échantillonnage
-# ---------------------------------------------------------------------
+# ------------------------------
 st.subheader("3) Échantillonnage & taille cible")
 target_mb = st.slider("Taille maximale du fichier compressé (.csv.gz)", 5, 25, 20, 1)
 target_bytes = target_mb * 1024 * 1024
 
 strat_col = st.selectbox(
-    "Stratifier l’échantillon (optionnel si une colonne cible existe)", 
+    "Stratifier l’échantillon (optionnel si une colonne cible existe)",
     ["— Aucune —"] + [c for c in df_sel.columns if c.lower() in {"target", "default", "y"}],
     index=0
 )
@@ -145,7 +128,6 @@ if strat_col == "— Aucune —":
     strat_col = None
 
 def estimate_rows_for_target(df_in: pd.DataFrame, target_bytes: int, sample_rows: int = 5000) -> int:
-    """Estime le nombre de lignes pour respecter la taille cible après compression gzip."""
     n = len(df_in)
     test = df_in if n <= sample_rows else df_in.sample(sample_rows, random_state=42)
     buf = io.BytesIO()
@@ -173,20 +155,20 @@ with st.spinner("Création de l’échantillon…"):
         else:
             df_out = df_sel.sample(n_rows, random_state=42)
 
-st.success(f"Échantillon créé : **{len[df_out]:,}** lignes, {df_out.shape[1]} colonnes")  # noqa
+st.success(f"Échantillon créé : **{len(df_out):,}** lignes, {df_out.shape[1]} colonnes")
 
 with st.expander("Aperçu de l’échantillon"):
     st.dataframe(df_out.head(20), use_container_width=True)
 
-# ---------------------------------------------------------------------
-# 4) Sauvegarde compressée + téléchargement
-# ---------------------------------------------------------------------
+# ------------------------------
+# 4) Sauvegarde compressée
+# ------------------------------
 st.subheader("4) Sauvegarder en .csv.gz (prêt pour GitHub)")
 out_path = PROC_DIR / "sample_clients.csv.gz"
 
 if st.button("💾 Enregistrer `data/processed/sample_clients.csv.gz`"):
-    # Re-vérifie que processed est bien un dossier
-    ensure_dir(PROC_DIR, "processed")
+    # On crée **seulement** le dossier processed si besoin
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with st.spinner("Écriture du fichier compressé…"):
         df_out.to_csv(out_path, index=False, compression="gzip")
 
@@ -199,4 +181,4 @@ if st.button("💾 Enregistrer `data/processed/sample_clients.csv.gz`"):
         mime="application/gzip",
     )
 
-st.caption("Astuce : pour éviter les erreurs 413, uploade ton fichier via l’**explorateur Codespaces** dans `data/raw/`.")
+st.caption("Astuce : pour éviter les erreurs 413, uploade ton fichier via l’explorateur Codespaces dans `data/raw/`.")
